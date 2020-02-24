@@ -1,6 +1,6 @@
-# this is used to check new servers and perform additional checks and changes if needed
-
 setup() {
+
+# this is used to check new servers and perform additional checks and changes if needed
 
 function echo_color() {
   declare -A colors=(
