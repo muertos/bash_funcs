@@ -1,0 +1,156 @@
+# this is used to check new servers and perform additional checks and changes if needed
+
+setup() {
+
+function echo_color() {
+  declare -A colors=(
+    [red]="\e[31m" [green]="\e[32m" [blue]="\e[34m" [cyan]="\e[36m" [lred]="\e[91m" [lgreen]="\e[92m" [lcyan]="\e[96m"
+  )
+  echo -e "${colors[$2]}$1\e[0m"
+}
+  
+# finish any remaining yum transactions
+echo_color "running yum-complete-transaction..." cyan
+yum-complete-transaction 2>&1 1>/dev/null
+
+# clear all cached yum packages
+echo_color "cleaning yum's cache..." cyan
+yum clean all 2>&1 1>/dev/null
+
+# update yum packages ( why not `yum update`? -> upgrade removes any obsoletes, update does not )
+echo_color "upgrading yum..." cyan
+yum -y upgrade 2>&1 1>/dev/null
+
+# found recent issue with curl missing ca certs and this fixes
+echo_color "yum reinstalling ca-certificates and openssl..." cyan
+yum -y reinstall ca-certificates openssl 2>&1 1>/dev/null
+
+# VPS's are not being provisioned with this Apache module
+echo_color "yum installing ea-apache24-mod_headers..." cyan
+yum -y install ea-apache24-mod_headers 2>&1 1>/dev/null
+
+# clean up duplicate rpm packages ( seems to only be an issue on new VPS's ):
+echo_color "cleaning duplicate rpm packages...\e[0m" cyan
+package-cleanup -y --cleandupes 2>&1 1>/dev/null
+
+# Check if dedicated server or VPS
+if [[ ! -d '/proc/vz/vzaquota/' ]]; then                                                   
+  # on a dedicated server
+  # needed Perl packages for IMH scripts
+  echo_color "cpan installing JSON::XS..." cyan
+  cpan -i JSON::XS 2>&1 1>/dev/null
+
+  # update kernel ( noticed kcarectl not enabled on new G3's, why's that? )
+  echo_color "updating kernel using kcarectl..." cyan
+  kcarectl -u 2>&1 1>/dev/null
+else 
+  # on a VPS    
+  # needed Perl packages for IMH scripts
+  echo_color "yum installing various perl modules:" cyan
+  echo_color "  perl-File-Slurp perl-YAML perl-YAML-Syck perl-Template-Toolkit" green
+  yum -y install perl-File-Slurp perl-YAML perl-YAML-Syck perl-Template-Toolkit 2>&1 1>/dev/null
+
+  # more needed Perl packages for IMH scripts
+  echo_color "cpan installing various perl modules:" cyan
+  echo_color "  Switch CDB_File LWP::Protocol::https IO::Scalar Date::Parse Text::Template" green
+  cpan -i Switch LWP::Protocol::https IO::Scalar Date::Parse Text::Template CDB_File >/dev/null 2>&1
+fi  
+
+# check that rsyslog is running
+if [ ! -f /var/log/messages ]; then
+  echo_color "found potential issue with rsyslog not logging, addressing..." cyan
+  rm -f /var/lib/rsyslog/imjournal.state
+  systemctl restart rsyslog
+fi
+
+# update quotas
+echo_color "update cPanel disk quotas..." cyan
+/scripts/fixquotas 2>&1 1>/dev/null
+
+# get apache mpm, install mpm_event if it's not installed
+mpm=$(yum list installed | grep mpm | awk {'print $1'})
+if [[ "$mpm" != 'ea-apache24-mod_mpm_event' ]]; then
+  echo_color "found mpm_worker, swapping to mpm_event..." cyan
+  yum -y swap $mpm ea-apache24-mod_mpm_event 2>&1 1>/dev/null
+fi
+
+# make PHP adjustments ( memory_limit > 32m, etc )
+echo_color "adjusting memory_limit for all versions of PHP to 256M" cyan
+sed -i.bk$(date +%F) "/^memory_limit/c\memory_limit = 256M" /opt/cpanel/ea-php*/root/etc/php.ini
+echo_color "rebuilding httpd and restarting" cyan
+/scripts/rebuildhttpdconf && httpd -t && \
+  /scripts/restartsrv_apache 2>&1 1>/dev/null && /scripts/restartsrv_apache_php_fpm 2>&1 1>/dev/null
+
+# imh-nginx changes
+if [[ -d /var/nginx ]]; then
+  # set X-Forwarded-For header
+  echo_color "imh-nginx found, installing ea-apache24-mod_remoteip..." cyan
+  yum -y install ea-apache24-mod_remoteip.x86_64 2>&1 1>/dev/null
+
+echo_color "setting \"RemoteIPHeader X-Forwarded-For\" in /etc/apache2/conf.d/includes/post_virtualhost_global.conf..." cyan
+cat << EOF >> /etc/apache2/conf.d/includes/post_virtualhost_global.conf
+
+<IfModule mod_remoteip.c>
+  RemoteIPHeader X-Forwarded-For
+$(/scripts/ipusage | awk '{print $1}' | awk '{ print "  RemoteIPInternalProxy " $1 }')
+</IfModule>
+EOF
+
+# add X-Real-IP to Apache's log entries    
+echo_color "adjusting Apache's log format, to include the \"X-Real-IP\" header..." cyan
+cat << EOF >> /etc/apache2/conf.d/includes/pre_virtualhost_global.conf
+
+<IfModule log_config_module>
+  LogFormat "%{X-Real-IP}i %l %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-Agent}i\"" combined
+</IfModule>
+<IfModule log_config_module>
+  ErrorLogFormat "[%{u}t] [%-m:%l] [pid %P:tid %T] %7F: %E: [client\ %{X-Real-IP}i] %M% ,\ referer\ %{Referer}i"
+</IfModule>
+EOF
+    
+  echo_color "nginx conf rebuild underway..." cyan
+  ngxconf -Rrd --fork
+fi
+
+# remove cPanel php include path files as they are not needed and have caused issues before
+echo_color "removing cPanel php include path files as they are not needed and have caused issues before..." cyan
+find /etc/apache2/conf.d/userdata -name cp_php_magic_include_path.conf -type f -delete
+
+# restarting this service can speed up ssh logins
+echo_color "restarting systemd-logind.service..." cyan
+systemctl restart systemd-logind.service
+
+# check that existence of zone file in ns.inmotionhosting.com for hostname
+if ! dig @ns.inmotionhosting.com `hostname` +short 1>/dev/null; then
+  echo_color "No A record found for `hostname` in ns.inmotionhosting.com" red
+fi
+
+# make sure hostname certificates get installed
+echo_color "service ssl check running..." cyan
+/usr/local/cpanel/bin/checkallsslcerts --allow-verbose --retry 2>&1 1>/dev/null
+
+# check for DNS clustering
+# if /var/cpanel/cluster is 4 bytes, it's empty, and clustering is not setup
+if [[ $(du -s /var/cpanel/cluster | awk {'print $1'}) == 4 ]]; then
+  echo_color "DNS clustering does not appear to be setup" lred
+  echo_color "ls /var/cpanel/cluster ->" blue
+  ls /var/cpanel/cluster
+else 
+  echo_color "DNS clustering is setup" lgreen
+fi
+
+# check for cPanel license
+if ! lynx -dump https://verify.cpanel.net/app/verify?ip=`hostname -i` | grep -si "inmotion" 2>&1 1>/dev/null; then
+  echo_color "cPanel license does not appear to be active" red
+else 
+  echo_color "cPanel license is active" lgreen
+fi
+
+# make sure cPanel license is active
+echo_color "ensure cPanel license is active..." cyan
+/usr/local/cpanel/cpkeyclt 2>&1 1>/dev/null
+
+# update cPanel
+echo_color "running /scripts/upcp in the background..." cyan
+/scripts/upcp --bg
+}
